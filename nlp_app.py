@@ -2,30 +2,32 @@ import streamlit as st
 import nltk
 from nltk.wsd import lesk
 from nltk.corpus import wordnet
-import spacy
-from spacy import displacy
+from nltk.tokenize import word_tokenize
+from nltk.tag import pos_tag
+from nltk.chunk import ne_chunk
+from nltk.tree import Tree
 import numpy as np
 from transformers import BertTokenizer, BertModel
 import torch
 from sklearn.metrics.pairwise import cosine_similarity
+import re
 import warnings
 warnings.filterwarnings('ignore')
 
 nltk.download('wordnet', quiet=True)
 nltk.download('punkt', quiet=True)
 nltk.download('averaged_perceptron_tagger', quiet=True)
+nltk.download('maxent_ne_chunker', quiet=True)
+nltk.download('words', quiet=True)
 nltk.download('punkt_tab', quiet=True)
 nltk.download('averaged_perceptron_tagger_eng', quiet=True)
+nltk.download('maxent_ne_chunker_tab', quiet=True)
 
 @st.cache_resource
 def load_bert():
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
     model = BertModel.from_pretrained('bert-base-uncased', output_hidden_states=True)
     return tokenizer, model
-
-@st.cache_resource
-def load_spacy():
-    return spacy.load('en_core_web_sm')
 
 def get_bert_embedding(tokenizer, model, sentence, target_word):
     inputs = tokenizer(sentence, return_tensors='pt')
@@ -49,40 +51,64 @@ def get_bert_embedding(tokenizer, model, sentence, target_word):
     else:
         return hidden_states[0][1:-1].mean(dim=0).numpy(), tokens
 
-def extract_srl(doc):
+def extract_ner_entities(sentence):
+    tokens = word_tokenize(sentence)
+    tagged = pos_tag(tokens)
+    chunks = ne_chunk(tagged)
+    
+    entities = {'GPE': [], 'DATE': [], 'TIME': [], 'ORG': [], 'PERSON': []}
+    
+    for chunk in chunks:
+        if isinstance(chunk, Tree):
+            entity_text = ' '.join([token for token, pos in chunk.leaves()])
+            entity_label = chunk.label()
+            if entity_label in entities:
+                entities[entity_label].append(entity_text)
+            elif entity_label == 'LOCATION':
+                entities['GPE'].append(entity_text)
+    
+    return entities
+
+def extract_srl_nltk(sentence):
+    tokens = word_tokenize(sentence)
+    tagged = pos_tag(tokens)
+    
     predicate = None
     a0 = None
     a1 = None
     am_loc = None
     am_tmp = None
     
-    for token in doc:
-        if token.dep_ == 'ROOT' and token.pos_ == 'VERB':
-            predicate = token.text
-            break
-        elif token.dep_ == 'ROOT':
-            predicate = token.text
+    for i, (word, tag) in enumerate(tagged):
+        if tag in ['VB', 'VBD', 'VBG', 'VBN', 'VBP', 'VBZ']:
+            if predicate is None:
+                predicate = word
     
-    for token in doc:
-        if token.dep_ == 'nsubj' and predicate:
-            a0 = token.text
-        
-        if token.dep_ == 'dobj' and predicate:
-            a1 = token.text
-        
-        if token.dep_ == 'prep':
-            for child in token.children:
-                if child.dep_ == 'pobj':
-                    if token.text.lower() in ['in', 'at', 'on', 'by', 'near']:
-                        am_loc = child.text
-                    elif token.text.lower() in ['during', 'before', 'after']:
-                        am_tmp = child.text
-        
-        if token.ent_type_ == 'GPE' and not am_loc:
-            am_loc = token.text
-        
-        if token.ent_type_ in ['DATE', 'TIME'] and not am_tmp:
-            am_tmp = token.text
+    for i, (word, tag) in enumerate(tagged):
+        if tag in ['NNP', 'NN', 'PRP']:
+            if i > 0 and tagged[i-1][1] in ['VB', 'VBD', 'VBG', 'VBN', 'VBP', 'VBZ']:
+                a1 = word
+            elif i < len(tagged) - 1:
+                next_word, next_tag = tagged[i+1]
+                if next_tag in ['VB', 'VBD', 'VBG', 'VBN', 'VBP', 'VBZ']:
+                    a0 = word
+    
+    entities = extract_ner_entities(sentence)
+    
+    if entities['GPE']:
+        am_loc = entities['GPE'][0]
+    if entities['DATE']:
+        am_tmp = entities['DATE'][0]
+    elif entities['TIME']:
+        am_tmp = entities['TIME'][0]
+    
+    prep_pattern = re.search(r'\b(in|at|on|by|near)\s+(\w+)', sentence.lower())
+    if prep_pattern and not am_loc:
+        am_loc = prep_pattern.group(2).capitalize()
+    
+    time_pattern = re.search(r'\b(this|last|next)\s+(year|month|week|day)\b', sentence.lower())
+    if time_pattern and not am_tmp:
+        am_tmp = time_pattern.group(0)
     
     return {
         'A0 (Agent)': a0 if a0 else '-',
@@ -91,6 +117,11 @@ def extract_srl(doc):
         'AM-LOC': am_loc if am_loc else '-',
         'AM-TMP': am_tmp if am_tmp else '-'
     }
+
+def get_pos_table(sentence):
+    tokens = word_tokenize(sentence)
+    tagged = pos_tag(tokens)
+    return [{'Token': w, 'POS': t} for w, t in tagged]
 
 def main():
     st.set_page_config(page_title='NLP Demo', page_icon='🧠', layout='wide')
@@ -122,7 +153,7 @@ def main():
                 st.subheader('📊 分析结果')
                 
                 with st.spinner('Lesk算法分析中...'):
-                    tokens = nltk.word_tokenize(sentence1)
+                    tokens = word_tokenize(sentence1)
                     synset = lesk(tokens, target_word)
                     
                     if synset:
@@ -160,20 +191,16 @@ def main():
     
     with tab2:
         st.header('语义角色标注 (Semantic Role Labeling)')
+        st.info('💡 使用NLTK进行词性标注和命名实体识别，通过启发式规则提取语义角色')
         
         sentence_srl = st.text_area('输入句子', 
                                    'Apple is manufacturing new smartphones in China this year.',
                                    height=80, key='srl_input')
         
         if st.button('🎯 分析语义角色', key='analyze_srl'):
-            nlp = load_spacy()
-            doc = nlp(sentence_srl)
-            
             st.subheader('📋 语义角色表格')
             
-            srl_result = extract_srl(doc)
-            
-            col_widths = [1, 1, 1, 1, 1]
+            srl_result = extract_srl_nltk(sentence_srl)
             
             table_data = {
                 '角色': ['A0 (施事者)', 'Predicate (谓词)', 'A1 (受事者)', 'AM-LOC (地点)', 'AM-TMP (时间)'],
@@ -183,23 +210,32 @@ def main():
             
             st.table(table_data)
             
-            st.subheader('📊 依存句法分析图')
+            st.subheader('📊 词性标注结果')
             
-            options = {'compact': True, 'bg': '#f0f0f5', 'color': '#333', 'font': 'Arial'}
-            html = displacy.render(doc, style='dep', options=options)
-            st.components.v1.html(html, height=300, scrolling=True)
+            tokens = word_tokenize(sentence_srl)
+            tagged = pos_tag(tokens)
             
-            with st.expander('📝 查看详细依存关系'):
-                dep_data = []
-                for token in doc:
-                    dep_data.append({
-                        'Token': token.text,
-                        'Lemma': token.lemma_,
-                        'POS': token.pos_,
-                        'Dep': token.dep_,
-                        'Head': token.head.text
-                    })
-                st.table(dep_data)
+            pos_data = []
+            for word, tag in tagged:
+                pos_data.append({
+                    'Token': word,
+                    'POS': tag,
+                    'Type': '动词' if tag.startswith('VB') else '名词' if tag.startswith('NN') else '形容词' if tag.startswith('JJ') else '其他'
+                })
+            st.table(pos_data)
+            
+            st.subheader('📍 命名实体识别')
+            
+            entities = extract_ner_entities(sentence_srl)
+            ner_data = []
+            for entity_type, values in entities.items():
+                if values:
+                    for v in values:
+                        ner_data.append({'类型': entity_type, '实体': v})
+            if ner_data:
+                st.table(ner_data)
+            else:
+                st.info('未识别到命名实体')
 
 if __name__ == '__main__':
     main()
